@@ -153,8 +153,38 @@ TEST_F(OffloadOnEvictTest, ComboA_OffloadAtPutEnd) {
     service->RemoveAll();
 }
 
-TEST_F(OffloadOnEvictTest, ComboA_EvictionWorks) {
-    // Regression: eviction still works in default mode
+TEST_F(OffloadOnEvictTest, ComboA_PutEndFailsWhenOffloadCannotBeQueued) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx =
+        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
+
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    auto put_start = service->PutStart(ctx.client_id, "key_no_offload",
+                                       "default", 1024, replicate_config);
+    ASSERT_TRUE(put_start.has_value());
+
+    auto put_end = service->PutEnd(ctx.client_id, "key_no_offload", "default",
+                                   ReplicaType::MEMORY);
+    ASSERT_FALSE(put_end.has_value())
+        << "Reliable PutEnd offload must fail when no LOCAL_DISK segment is "
+           "available";
+
+    auto exists = service->ExistKey("key_no_offload", "default");
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value())
+        << "Failed reliable PutEnd must not expose the object";
+
+    service->RemoveAll();
+}
+
+TEST_F(OffloadOnEvictTest, ComboA_PendingOffloadsBlockUnsafeEviction) {
+    // Reliable default mode pins source MEMORY replicas until offload success,
+    // so eviction must not free those replicas before LOCAL_DISK is committed.
     const uint64_t kv_lease_ttl = 2000;
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -166,12 +196,15 @@ TEST_F(OffloadOnEvictTest, ComboA_EvictionWorks) {
     constexpr size_t object_size = 1024 * 15;
     auto ctx =
         PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
+    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
+    ASSERT_TRUE(mount_ld.has_value());
 
     // Put more objects than the segment can hold
     int success_puts = FillSegmentUntilEviction(
         *service, ctx.client_id, "evict_a_", object_size, 1024 * 16 + 50);
-    EXPECT_GT(success_puts, 1024 * 16)
-        << "Default: eviction should allow more puts than capacity";
+    EXPECT_LE(success_puts, 1024 * 16)
+        << "Default reliable offload must not evict pending, non-offloaded "
+           "MEMORY replicas";
 
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     service->RemoveAll();

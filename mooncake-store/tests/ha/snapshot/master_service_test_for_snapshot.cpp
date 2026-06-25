@@ -2485,11 +2485,8 @@ TEST_F(MasterServiceSnapshotTest, OffloadObjectHeartbeat) {
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
     auto mount_local_disk_result =
-        service_->MountLocalDiskSegment(client_id, false);
+        service_->MountLocalDiskSegment(client_id, true);
     ASSERT_TRUE(mount_local_disk_result.has_value());
-    for (size_t i = 0; i < key_cnt; i++) {
-        auto key = GenerateKeyForSegment(client_id, service_, segment.name);
-    }
     auto res = service_->OffloadObjectHeartbeat(client_id, true);
     if (!res) {
         LOG(ERROR) << "OffloadObjectHeartbeat failed with error: "
@@ -2516,6 +2513,41 @@ TEST_F(MasterServiceSnapshotTest, OffloadObjectHeartbeat) {
         ASSERT_TRUE(it != res->end());
         ASSERT_EQ(it->size, 1024);
     }
+
+    res = service_->OffloadObjectHeartbeat(client_id, true);
+    if (!res) {
+        LOG(ERROR) << "OffloadObjectHeartbeat failed with error: "
+                   << res.error();
+        ASSERT_TRUE(res);
+    }
+    ASSERT_EQ(res->size(), keys.size());
+
+    std::vector<OffloadTaskItem> completed_tasks;
+    std::vector<StorageObjectMetadata> completed_metadata;
+    completed_tasks.reserve(keys.size());
+    completed_metadata.reserve(keys.size());
+    for (auto& key : keys) {
+        completed_tasks.push_back(
+            OffloadTaskItem{.tenant_id = "default", .key = key, .size = 1024});
+        completed_metadata.push_back(StorageObjectMetadata{
+            .bucket_id = 0,
+            .offset = 0,
+            .key_size = static_cast<int64_t>(key.size()),
+            .data_size = 1024,
+            .transport_endpoint = "endpoint"});
+    }
+    auto notify_res =
+        service_->NotifyOffloadSuccess(client_id, completed_tasks,
+                                       completed_metadata);
+    ASSERT_TRUE(notify_res.has_value());
+
+    res = service_->OffloadObjectHeartbeat(client_id, true);
+    if (!res) {
+        LOG(ERROR) << "OffloadObjectHeartbeat failed with error: "
+                   << res.error();
+        ASSERT_TRUE(res);
+    }
+    ASSERT_EQ(res->size(), 0);
 
     keys.clear();
     for (size_t i = 0; i < key_cnt; i++) {

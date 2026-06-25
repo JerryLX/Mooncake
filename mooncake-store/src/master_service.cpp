@@ -1719,20 +1719,45 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 
     if (enable_offload_ && !offload_on_evict_) {
         auto& tenant_state = accessor.GetTenantState();
+        if (tenant_state.offloading_tasks.count(object_id.user_key) > 0) {
+            return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+        }
+        bool queued = false;
+        ErrorCode last_error = ErrorCode::UNABLE_OFFLOADING;
         metadata.VisitReplicas(
-            [](const Replica& replica) {
-                return replica.is_completed() && replica.is_memory_replica();
+            [&queued](const Replica& replica) {
+                return !queued && replica.is_completed() &&
+                       replica.is_memory_replica();
             },
-            [this, &object_id, &tenant_state](Replica& replica) {
+            [this, &object_id, &tenant_state, &queued,
+             &last_error](Replica& replica) {
                 auto result = PushOffloadingQueue(object_id, replica);
                 if (result) {
                     replica.inc_refcnt();
-                    tenant_state.offloading_tasks.emplace(
+                    auto task_result = tenant_state.offloading_tasks.emplace(
                         object_id.user_key,
                         OffloadingTask{replica.id(),
                                        std::chrono::system_clock::now()});
+                    if (!task_result.second) {
+                        replica.dec_refcnt();
+                        last_error = ErrorCode::OBJECT_ALREADY_EXISTS;
+                        return;
+                    }
+                    queued = true;
+                } else {
+                    last_error = result.error();
                 }
             });
+        if (!queued) {
+            MC_LOG(ERROR) << "Failed to enqueue key for reliable offload: key="
+                          << key << ", tenant_id=" << tenant_id
+                          << ", error=" << last_error;
+            if (accessor.InProcessing()) {
+                accessor.EraseFromProcessing();
+            }
+            accessor.Erase();
+            return tl::make_unexpected(last_error);
+        }
     }
 
     // If the object is completed, remove it from the processing set.
@@ -3172,7 +3197,6 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                       << client_id;
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
-    std::unordered_map<std::string, OffloadTaskItem> offloading_objects_copy;
     {
         MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
         local_disk_segment_it->second->enable_offloading = enable_offloading;
@@ -3184,37 +3208,7 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                  local_disk_segment_it->second->offloading_objects) {
                 result.push_back(task);
             }
-            local_disk_segment_it->second->offloading_objects.clear();
             return result;
-        }
-        // Offloading is disabled: clear the pending queue to prevent
-        // unbounded growth that would trigger KEYS_ULTRA_LIMIT in
-        // PushOffloadingQueue. We must also clean up corresponding
-        // offloading_tasks and decrement source replica refcounts to avoid
-        // resource leaks and blocked writes (OBJECT_HAS_REPLICATION_TASK).
-        // Copy keys out before releasing the mutex to avoid lock order
-        // violation: the lock order is Shard Lock -> offloading_mutex_, so we
-        // must release offloading_mutex_ before taking shard locks via
-        // MetadataAccessorRW.
-        offloading_objects_copy =
-            std::move(local_disk_segment_it->second->offloading_objects);
-    }
-
-    for (auto& [_, task] : offloading_objects_copy) {
-        const auto object_id = MakeObjectIdentity(task.key, task.tenant_id);
-        MetadataAccessorRW accessor(this, object_id);
-        if (accessor.Exists()) {
-            auto& tenant_state = accessor.GetTenantState();
-            auto task_it =
-                tenant_state.offloading_tasks.find(object_id.user_key);
-            if (task_it != tenant_state.offloading_tasks.end()) {
-                auto source =
-                    accessor.Get().GetReplicaByID(task_it->second.source_id);
-                if (source) {
-                    source->dec_refcnt();
-                }
-                tenant_state.offloading_tasks.erase(task_it);
-            }
         }
     }
     return {};
@@ -3269,6 +3263,22 @@ auto MasterService::NotifyOffloadSuccess(
         const auto& metadata = metadatas[i];
         const auto object_id = MakeObjectIdentity(task.key, task.tenant_id);
         total_ssd_increment += metadata.data_size;
+
+        // Add LOCAL_DISK replica before acknowledging the offload task. If
+        // metadata update fails, keep the task queued so a later heartbeat can
+        // retry instead of silently dropping the offload.
+        Replica replica(client_id, metadata.data_size,
+                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);
+        auto res = AddReplica(client_id, object_id.user_key,
+                              object_id.tenant_id, replica);
+        if (!res && res.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            MC_LOG(ERROR) << "Failed to add replica: error=" << res.error()
+                          << ", client_id=" << client_id
+                          << ", tenant_id=" << object_id.tenant_id
+                          << ", key=" << object_id.user_key;
+            return tl::make_unexpected(res.error());
+        }
+
         // Release refcnt and clear offloading task.
         {
             MetadataAccessorRW accessor(this, object_id);
@@ -3287,18 +3297,20 @@ auto MasterService::NotifyOffloadSuccess(
                 }
             }
         }
-
-        // Add LOCAL_DISK replica.
-        Replica replica(client_id, metadata.data_size,
-                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);
-        auto res = AddReplica(client_id, object_id.user_key,
-                              object_id.tenant_id, replica);
-        if (!res && res.error() != ErrorCode::OBJECT_NOT_FOUND) {
-            MC_LOG(ERROR) << "Failed to add replica: error=" << res.error()
-                          << ", client_id=" << client_id
-                          << ", tenant_id=" << object_id.tenant_id
-                          << ", key=" << object_id.user_key;
-            return tl::make_unexpected(res.error());
+        {
+            ScopedLocalDiskSegmentAccess local_disk_segment_access =
+                segment_manager_.getLocalDiskSegmentAccess();
+            auto& client_local_disk_segment =
+                local_disk_segment_access.getClientLocalDiskSegment();
+            auto local_disk_segment_it =
+                client_local_disk_segment.find(client_id);
+            if (local_disk_segment_it != client_local_disk_segment.end()) {
+                MutexLocker locker(
+                    &local_disk_segment_it->second->offloading_mutex_);
+                local_disk_segment_it->second->offloading_objects.erase(
+                    MakeTenantScopedStorageKey(object_id.tenant_id,
+                                               object_id.user_key));
+            }
         }
     }
 

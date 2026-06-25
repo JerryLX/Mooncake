@@ -554,8 +554,6 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();
             if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
-                MutexLocker locker(&offloading_mutex_);
-                enable_offloading_ = false;
                 return tl::make_unexpected(offload_res.error());
             }
             if (offload_res.error() != ErrorCode::INVALID_READ) {
