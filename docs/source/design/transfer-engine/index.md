@@ -354,6 +354,14 @@ kunpeng_ub_transport
 sunrise_link_transport
 :::
 
+## Chinese Guides
+
+:::{toctree}
+:maxdepth: 1
+
+te-and-ub-enablement
+:::
+
 ## Benchmark and Tuning Guide
 
 :::{toctree}
